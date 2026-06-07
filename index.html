@@ -1,0 +1,437 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Swinomish Channel Current</title>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      background: #071624;
+      color: #ddeef5;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      min-height: 100vh;
+      padding: 1rem;
+      max-width: 640px;
+      margin: 0 auto;
+    }
+
+    header { text-align: center; margin-bottom: 1.2rem; }
+    header h1 { font-size: 1.1rem; letter-spacing: 0.08em; color: #b0d4e8; }
+    header .sub { font-size: 0.72rem; color: #4a7a8a; margin-top: 0.15rem; }
+
+    .now-banner {
+      text-align: center;
+      padding: 1rem;
+      margin-bottom: 1rem;
+      background: #0c1e2e;
+      border: 1px solid #1b3d55;
+      border-radius: 12px;
+    }
+    .now-label { font-size: 0.65rem; text-transform: uppercase; letter-spacing: 0.1em; color: #4a7a8a; margin-bottom: 0.3rem; }
+    .now-dir { font-size: 1.8rem; font-weight: 700; }
+    .now-dir.north { color: #4caf50; }
+    .now-dir.south { color: #ef5350; }
+    .now-dir.slack { color: #42a5f5; }
+    .now-dir.unknown { color: #555; }
+    .now-rule { font-size: 0.78rem; color: #7aabb8; margin-top: 0.4rem; line-height: 1.5; }
+
+    .chart-section {
+      background: #0c1e2e;
+      border: 1px solid #1b3d55;
+      border-radius: 12px;
+      padding: 0.8rem;
+      margin-bottom: 0.8rem;
+    }
+    .chart-title {
+      font-size: 0.7rem;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      color: #4a7a8a;
+      margin-bottom: 0.5rem;
+    }
+    .chart-wrap { position: relative; height: 240px; }
+
+    .legend {
+      display: flex;
+      gap: 1rem;
+      justify-content: center;
+      margin-top: 0.5rem;
+      font-size: 0.7rem;
+      color: #7aabb8;
+    }
+    .legend-item { display: flex; align-items: center; gap: 0.3rem; }
+    .legend-dot { width: 10px; height: 10px; border-radius: 3px; }
+
+    .rules-section {
+      background: #0c1e2e;
+      border: 1px solid #1b3d55;
+      border-radius: 12px;
+      padding: 0.8rem 1rem;
+      margin-bottom: 0.8rem;
+      font-size: 0.78rem;
+      line-height: 1.7;
+      color: #7aabb8;
+    }
+    .rules-section .rules-title {
+      font-size: 0.7rem;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      color: #4a7a8a;
+      margin-bottom: 0.5rem;
+    }
+    .rules-section ul { padding-left: 1.2rem; margin: 0; }
+    .rules-section li { margin-bottom: 0.2rem; }
+    .rule-north { color: #4caf50; }
+    .rule-south { color: #ef5350; }
+    .rule-slack { color: #42a5f5; }
+
+    .note {
+      font-size: 0.62rem;
+      color: #3a5a68;
+      text-align: center;
+      margin-top: 0.5rem;
+      line-height: 1.6;
+    }
+    .note a { color: #4a7a8a; }
+
+    .loading { text-align: center; color: #4a7a8a; padding: 3rem 1rem; }
+    .error { color: #ef9a9a; text-align: center; padding: 2rem 1rem; font-size: 0.85rem; }
+  </style>
+</head>
+<body>
+
+<header>
+  <h1>Swinomish Channel</h1>
+  <div class="sub" id="dateLine"></div>
+</header>
+
+<div id="app">
+  <p class="loading">Loading tide data from NOAA...</p>
+</div>
+
+<script>
+const SEATTLE  = '9447130';
+const LACONNER = '9448558';
+const SLACK_MIN_MS = 2 * 3600000;
+const SLACK_MAX_MS = 3.5 * 3600000;
+
+function parseT(s) { return new Date(s.replace(' ', 'T')).getTime(); }
+
+function fmtTime(ms) {
+  const d = new Date(ms);
+  const h = d.getHours(), m = d.getMinutes();
+  return `${h % 12 || 12}:${String(m).padStart(2, '0')} ${h >= 12 ? 'pm' : 'am'}`;
+}
+
+function hrsMin(ms) {
+  const h = Math.floor(ms / 3600000);
+  const m = Math.round((ms % 3600000) / 60000);
+  if (h === 0) return `${m} min`;
+  if (m === 0) return `${h} hr`;
+  return `${h} hr ${m} min`;
+}
+
+async function fetchNOAA(station, interval = 'hilo') {
+  const now = new Date();
+  const d = n => { const x = new Date(now); x.setDate(x.getDate() + n); return x; };
+  const fmt = x => `${x.getFullYear()}${String(x.getMonth()+1).padStart(2,'0')}${String(x.getDate()).padStart(2,'0')}`;
+  const url = `https://api.tidesandcurrents.noaa.gov/api/prod/datagetter?` +
+    `begin_date=${fmt(d(-1))}&end_date=${fmt(d(1))}&station=${station}` +
+    `&product=predictions&datum=MLLW&time_zone=lst_ldt&interval=${interval}` +
+    `&units=english&application=swinomish&format=json`;
+  const r = await fetch(url);
+  const j = await r.json();
+  if (j.error) throw new Error(j.error.message);
+  return j.predictions;
+}
+
+async function fetchAllData() {
+  const [seattleCurveRaw, seattleHiLoRaw, laConnerHiLoRaw] = await Promise.all([
+    fetchNOAA(SEATTLE, '6'),
+    fetchNOAA(SEATTLE, 'hilo'),
+    fetchNOAA(LACONNER, 'hilo')
+  ]);
+
+  const laConnerHiLo = laConnerHiLoRaw.map(p => ({ time: parseT(p.t), height: parseFloat(p.v), type: p.type }));
+  const seattleHiLo  = seattleHiLoRaw.map(p => ({ time: parseT(p.t), height: parseFloat(p.v), type: p.type }));
+
+  // Calculate average time offset between Seattle and La Conner hi/lo
+  let offsetSum = 0, offsetCount = 0;
+  for (const lc of laConnerHiLo) {
+    const match = seattleHiLo.find(s => s.type === lc.type && Math.abs(s.time - lc.time) < 4 * 3600000);
+    if (match) { offsetSum += lc.time - match.time; offsetCount++; }
+  }
+  const timeOffset = offsetCount > 0 ? offsetSum / offsetCount : 30 * 60000;
+
+  // Shift Seattle 6-min curve by the calculated offset to approximate Swinomish
+  const curve = seattleCurveRaw.map(p => ({ x: parseT(p.t) + timeOffset, y: parseFloat(p.v) }));
+
+  return { curve, laConnerHiLo };
+}
+
+function currentAt(ms, hilo) {
+  let pi = -1;
+  for (let i = 0; i < hilo.length; i++) {
+    if (hilo[i].time <= ms) pi = i; else break;
+  }
+  if (pi < 0 || pi >= hilo.length - 1) return { dir: 'unknown' };
+
+  const prev = hilo[pi];
+  const next = hilo[pi + 1];
+  const since = ms - prev.time;
+
+  if (since < SLACK_MIN_MS) {
+    return { dir: prev.type === 'H' ? 'north' : 'south', prev, next, since };
+  }
+  if (since <= SLACK_MAX_MS) {
+    return { dir: 'slack', prev, next, since };
+  }
+  return { dir: prev.type === 'H' ? 'south' : 'north', prev, next, since };
+}
+
+function buildRuleText(status, now) {
+  const { dir, prev, next, since } = status;
+  if (!prev) return '';
+
+  const prevLabel = prev.type === 'H' ? 'high' : 'low';
+  const sinceStr = hrsMin(since);
+  const slackStart = prev.time + SLACK_MIN_MS;
+  const slackEnd = prev.time + SLACK_MAX_MS;
+
+  if (dir === 'north' || dir === 'south') {
+    if (since < SLACK_MIN_MS) {
+      return `${sinceStr} after ${prevLabel} tide (${fmtTime(prev.time)})<br>` +
+             `Slack expected ~${fmtTime(slackStart)}–${fmtTime(slackEnd)}`;
+    } else {
+      const nextLabel = next.type === 'H' ? 'high' : 'low';
+      const nextSlackStart = next.time + SLACK_MIN_MS;
+      const nextSlackEnd = next.time + SLACK_MAX_MS;
+      return `${sinceStr} after ${prevLabel} tide (${fmtTime(prev.time)})<br>` +
+             `Next slack after ${nextLabel} ~${fmtTime(nextSlackStart)}–${fmtTime(nextSlackEnd)}`;
+    }
+  }
+
+  if (dir === 'slack') {
+    return `Slack window — ${sinceStr} after ${prevLabel} tide (${fmtTime(prev.time)})<br>` +
+           `Slack until ~${fmtTime(slackEnd)}`;
+  }
+
+  return '';
+}
+
+function render(curve, hilo) {
+  const now = Date.now();
+  const today = new Date(now);
+  const dayStart = new Date(today); dayStart.setHours(0,0,0,0);
+  const dayEnd   = new Date(today); dayEnd.setHours(23,59,59,999);
+  const dsMs = dayStart.getTime(), deMs = dayEnd.getTime();
+
+  const todayCurve = curve.filter(p => p.x >= dsMs && p.x <= deMs);
+  const todayHiLo = hilo.filter(e => e.time >= dsMs - 4*3600000 && e.time <= deMs + 4*3600000);
+
+  const status = currentAt(now, hilo);
+  const { dir } = status;
+  const dirLabel = { north: 'Flooding North', south: 'Ebbing South', slack: 'Slack Water', unknown: '—' }[dir];
+  const arrow = { north: '↑', south: '↓', slack: '↔', unknown: '' }[dir];
+  const ruleText = buildRuleText(status, now);
+
+  document.getElementById('dateLine').textContent =
+    today.toLocaleDateString('en-US', { weekday: 'long', month: 'long', day: 'numeric' }) + '  ·  ' + fmtTime(now);
+
+  document.getElementById('app').innerHTML = `
+    <div class="now-banner">
+      <div class="now-label">Current direction now</div>
+      <div class="now-dir ${dir}">${arrow} ${dirLabel}</div>
+      ${ruleText ? `<div class="now-rule">${ruleText}</div>` : ''}
+    </div>
+
+    <div class="chart-section">
+      <div class="chart-title">Swinomish Channel Tide + Estimated Current</div>
+      <div class="chart-wrap"><canvas id="tideChart"></canvas></div>
+      <div class="legend">
+        <div class="legend-item"><div class="legend-dot" style="background:#4caf50"></div>North</div>
+        <div class="legend-item"><div class="legend-dot" style="background:#ef5350"></div>South</div>
+        <div class="legend-item"><div class="legend-dot" style="background:#42a5f5"></div>Slack</div>
+      </div>
+    </div>
+
+    <div class="rules-section">
+      <div class="rules-title">Rules of Thumb Applied (Port of Skagit / La Conner)</div>
+      <ul>
+        <li><span class="rule-north">North current</span> flows 2–3.5 hrs before high water through 2–3.5 hrs after high water</li>
+        <li><span class="rule-south">South current</span> flows 2–3.5 hrs before low water through 2–3.5 hrs after low water</li>
+        <li><span class="rule-slack">Slack water</span> occurs 2–3.5 hrs after each high or low (larger tide range = closer to 3.5 hrs)</li>
+      </ul>
+      <div style="margin-top:0.6rem; font-size:0.72rem; color:#4a7a8a;">
+        Today's La Conner hi/lo:
+        ${todayHiLo.filter(e => e.time >= dsMs && e.time <= deMs)
+          .map(e => `<strong style="color:#b0d4e8">${e.type === 'H' ? 'High' : 'Low'} ${e.height.toFixed(1)} ft</strong> at ${fmtTime(e.time)} → slack ~${fmtTime(e.time + SLACK_MIN_MS)}–${fmtTime(e.time + SLACK_MAX_MS)}`)
+          .join('<br>')}
+      </div>
+    </div>
+
+    <div class="note">
+      <strong style="color:#ef9a9a;">NOT FOR NAVIGATION.</strong> This tool is an informal estimate only — not an official source and not affiliated with
+      NOAA, the Coast Guard, or the Port of Skagit. Current direction is approximated from rules of thumb and may be
+      significantly wrong due to tidal range, river runoff, wind, or other conditions. Always verify with local observation
+      and use official NOAA data for navigation decisions.<br><br>
+      Tide curve: Seattle 6-min predictions (NOAA 9447130) time-shifted to match La Conner hi/lo (NOAA 9448558).
+      Current direction: estimated from La Conner hi/lo using local rules of thumb.
+      <a href="https://tidesandcurrents.noaa.gov/noaatidepredictions.html?id=9448558" target="_blank">NOAA source</a>
+    </div>
+  `;
+
+  const colorRGB = {
+    north:   [76,175,80],
+    south:   [239,83,80],
+    slack:   [66,165,245],
+    unknown: [50,50,50]
+  };
+  const BAND_ALPHA = 0.2;
+
+  new Chart(document.getElementById('tideChart').getContext('2d'), {
+    type: 'line',
+    data: {
+      datasets: [{
+        data: todayCurve,
+        borderColor: '#b0d4e8',
+        backgroundColor: 'rgba(176,212,232,0.06)',
+        borderWidth: 2,
+        pointRadius: 0,
+        fill: true,
+        tension: 0.4
+      }]
+    },
+    options: {
+      responsive: true, maintainAspectRatio: false, animation: false,
+      plugins: {
+        legend: { display: false },
+        tooltip: {
+          enabled: true,
+          displayColors: false,
+          backgroundColor: 'rgba(12,30,46,0.9)',
+          borderColor: '#1b3d55',
+          borderWidth: 1,
+          titleFont: { size: 12 },
+          bodyFont: { size: 12 },
+          callbacks: {
+            title: items => fmtTime(items[0].parsed.x),
+            label: item => item.parsed.y.toFixed(1) + ' ft'
+          }
+        }
+      },
+      scales: {
+        x: {
+          type: 'linear', min: dsMs, max: deMs,
+          ticks: { color: '#4a7a8a', maxTicksLimit: 9, font: { size: 11 },
+                   callback: v => fmtTime(v) },
+          grid: { color: '#0f2030' }
+        },
+        y: {
+          ticks: { color: '#4a7a8a', font: { size: 11 },
+                   callback: v => v.toFixed(0) + ' ft' },
+          grid: { color: '#0f2030' }
+        }
+      }
+    },
+    plugins: [{
+      id: 'currentBands',
+      beforeDraw(chart) {
+        const { ctx, chartArea: { left, right, top, bottom }, scales: { x } } = chart;
+        const sampleStep = 2 * 60000;
+        const blurRadius = 14;
+
+        // Sample raw direction colors at fine intervals
+        const samples = [];
+        for (let t = dsMs; t <= deMs; t += sampleStep) {
+          const { dir } = currentAt(t, hilo);
+          samples.push(colorRGB[dir] || colorRGB.unknown);
+        }
+
+        // Box-blur the RGB samples to smooth transitions
+        const blurred = samples.map((_, i) => {
+          let rSum = 0, gSum = 0, bSum = 0, count = 0;
+          for (let j = i - blurRadius; j <= i + blurRadius; j++) {
+            const k = Math.max(0, Math.min(samples.length - 1, j));
+            rSum += samples[k][0]; gSum += samples[k][1]; bSum += samples[k][2];
+            count++;
+          }
+          return [Math.round(rSum/count), Math.round(gSum/count), Math.round(bSum/count)];
+        });
+
+        // Draw blurred bands
+        for (let i = 0; i < blurred.length - 1; i++) {
+          const t = dsMs + i * sampleStep;
+          const [r, g, b] = blurred[i];
+          const x1 = x.getPixelForValue(t);
+          const x2 = x.getPixelForValue(t + sampleStep);
+          ctx.fillStyle = `rgba(${r},${g},${b},${BAND_ALPHA})`;
+          ctx.fillRect(x1, top, x2 - x1 + 0.5, bottom - top);
+        }
+      }
+    }, {
+      id: 'annotations',
+      afterDraw(chart) {
+        const { ctx, scales: { x, y } } = chart;
+
+        // Hi/Lo vertical lines and labels
+        for (const ev of todayHiLo) {
+          if (ev.time < dsMs || ev.time > deMs) continue;
+          const px = x.getPixelForValue(ev.time);
+          const py = y.getPixelForValue(ev.height);
+
+          // Dashed vertical line
+          ctx.save();
+          ctx.strokeStyle = 'rgba(176,212,232,0.2)';
+          ctx.lineWidth = 1;
+          ctx.setLineDash([3, 4]);
+          ctx.beginPath(); ctx.moveTo(px, y.top); ctx.lineTo(px, y.bottom); ctx.stroke();
+          ctx.setLineDash([]);
+          ctx.restore();
+
+          // Height + time labels
+          const above = ev.type === 'H';
+          ctx.save();
+          ctx.fillStyle = '#b0d4e8';
+          ctx.font = '11px -apple-system, sans-serif';
+          ctx.textAlign = 'center';
+          ctx.fillText(`${ev.height.toFixed(1)} ft`, px, py + (above ? -18 : 22));
+          ctx.fillStyle = '#4a7a8a';
+          ctx.font = '10px -apple-system, sans-serif';
+          ctx.fillText(fmtTime(ev.time), px, py + (above ? -6 : 34));
+          ctx.restore();
+        }
+
+        // Now line
+        const nx = x.getPixelForValue(now);
+        ctx.save();
+        ctx.strokeStyle = 'rgba(255,255,255,0.6)';
+        ctx.lineWidth = 1.5;
+        ctx.setLineDash([4, 3]);
+        ctx.beginPath(); ctx.moveTo(nx, y.top); ctx.lineTo(nx, y.bottom); ctx.stroke();
+        ctx.setLineDash([]);
+        ctx.fillStyle = '#ddd';
+        ctx.font = '9px -apple-system, sans-serif';
+        ctx.textAlign = 'center';
+        ctx.fillText('Now', nx, y.top - 4);
+        ctx.restore();
+      }
+    }]
+  });
+}
+
+(async () => {
+  try {
+    const { curve, laConnerHiLo } = await fetchAllData();
+    render(curve, laConnerHiLo);
+  } catch (err) {
+    document.getElementById('app').innerHTML =
+      `<p class="error">Failed to load tide data.<br>${err.message}<br><br>
+       <a href="." style="color:#42a5f5">Try again</a></p>`;
+  }
+})();
+</script>
+</body>
+</html>
