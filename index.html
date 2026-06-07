@@ -122,8 +122,12 @@
 <script>
 const SEATTLE  = '9447130';
 const LACONNER = '9448558';
-const SLACK_MIN_MS = 2 * 3600000;
-const SLACK_MAX_MS = 3.5 * 3600000;
+const SLACK_EARLIEST_MS = 2.5 * 3600000;
+const SLACK_LATEST_MS   = 4.0 * 3600000;
+const SLACK_DURATION_MS = 20 * 60000;
+
+const RANGE_SMALL_FT = 4;
+const RANGE_LARGE_FT = 12;
 
 function parseT(s) { return new Date(s.replace(' ', 'T')).getTime(); }
 
@@ -179,54 +183,72 @@ async function fetchAllData() {
   return { curve, laConnerHiLo };
 }
 
+function tidalRange(prev, next) {
+  return Math.abs(prev.height - next.height);
+}
+
+function slackOffset(range) {
+  const t = Math.max(0, Math.min(1, (range - RANGE_SMALL_FT) / (RANGE_LARGE_FT - RANGE_SMALL_FT)));
+  return SLACK_EARLIEST_MS + t * (SLACK_LATEST_MS - SLACK_EARLIEST_MS);
+}
+
 function currentAt(ms, hilo) {
   let pi = -1;
   for (let i = 0; i < hilo.length; i++) {
     if (hilo[i].time <= ms) pi = i; else break;
   }
-  if (pi < 0 || pi >= hilo.length - 1) return { dir: 'unknown' };
+  if (pi < 0 || pi >= hilo.length - 1) return { dir: 'unknown', confidence: 0, slackAmount: 0 };
 
   const prev = hilo[pi];
   const next = hilo[pi + 1];
   const since = ms - prev.time;
+  const range = tidalRange(prev, next);
+  const estSlack = slackOffset(range);
+  const slackCenter = prev.time + estSlack;
 
-  if (since < SLACK_MIN_MS) {
-    return { dir: prev.type === 'H' ? 'north' : 'south', prev, next, since };
+  const beforeDir = prev.type === 'H' ? 'north' : 'south';
+  const afterDir  = prev.type === 'H' ? 'south' : 'north';
+
+  const distFromCenter = Math.abs(ms - slackCenter);
+  const transitionZone = 50 * 60000;
+  const coreZone = SLACK_DURATION_MS / 2;
+
+  if (distFromCenter <= coreZone) {
+    return { dir: ms < slackCenter ? beforeDir : afterDir, confidence: 0, slackAmount: 1, prev, next, since, estSlack, range };
   }
-  if (since <= SLACK_MAX_MS) {
-    return { dir: 'slack', prev, next, since };
-  }
-  return { dir: prev.type === 'H' ? 'south' : 'north', prev, next, since };
+
+  const t = Math.min(1, (distFromCenter - coreZone) / (transitionZone - coreZone));
+  const slackAmount = 1 - t;
+  const confidence = t;
+  const dir = ms < slackCenter ? beforeDir : afterDir;
+  return { dir, confidence, slackAmount, prev, next, since, estSlack, range };
 }
 
 function buildRuleText(status, now) {
-  const { dir, prev, next, since } = status;
+  const { prev, next, since, estSlack, range, slackAmount } = status;
   if (!prev) return '';
 
   const prevLabel = prev.type === 'H' ? 'high' : 'low';
   const sinceStr = hrsMin(since);
-  const slackStart = prev.time + SLACK_MIN_MS;
-  const slackEnd = prev.time + SLACK_MAX_MS;
+  const slackCenter = prev.time + estSlack;
+  const rangeNote = range != null ? ` (${range.toFixed(1)} ft range → ~${hrsMin(estSlack)} offset)` : '';
 
-  if (dir === 'north' || dir === 'south') {
-    if (since < SLACK_MIN_MS) {
-      return `${sinceStr} after ${prevLabel} tide (${fmtTime(prev.time)})<br>` +
-             `Slack expected ~${fmtTime(slackStart)}–${fmtTime(slackEnd)}`;
-    } else {
-      const nextLabel = next.type === 'H' ? 'high' : 'low';
-      const nextSlackStart = next.time + SLACK_MIN_MS;
-      const nextSlackEnd = next.time + SLACK_MAX_MS;
-      return `${sinceStr} after ${prevLabel} tide (${fmtTime(prev.time)})<br>` +
-             `Next slack after ${nextLabel} ~${fmtTime(nextSlackStart)}–${fmtTime(nextSlackEnd)}`;
-    }
+  if (slackAmount >= 0.7) {
+    return `Slack water — ${sinceStr} after ${prevLabel} tide (${fmtTime(prev.time)})<br>` +
+           `Based on ${range.toFixed(1)} ft tidal range${rangeNote}`;
   }
 
-  if (dir === 'slack') {
-    return `Slack window — ${sinceStr} after ${prevLabel} tide (${fmtTime(prev.time)})<br>` +
-           `Slack until ~${fmtTime(slackEnd)}`;
+  if (since < estSlack) {
+    return `${sinceStr} after ${prevLabel} tide (${fmtTime(prev.time)})<br>` +
+           `Slack estimated ~${fmtTime(slackCenter)}${rangeNote}`;
   }
 
-  return '';
+  const nextRange = tidalRange(next, prev);
+  const nextEst = slackOffset(nextRange);
+  const nextSlackCenter = next.time + nextEst;
+  const nextLabel = next.type === 'H' ? 'high' : 'low';
+  return `${sinceStr} after ${prevLabel} tide (${fmtTime(prev.time)})<br>` +
+         `Next slack ~${fmtTime(nextSlackCenter)} (after ${nextLabel})`;
 }
 
 function render(curve, hilo) {
@@ -240,9 +262,9 @@ function render(curve, hilo) {
   const todayHiLo = hilo.filter(e => e.time >= dsMs - 4*3600000 && e.time <= deMs + 4*3600000);
 
   const status = currentAt(now, hilo);
-  const { dir } = status;
-  const dirLabel = { north: 'Flooding North', south: 'Ebbing South', slack: 'Slack Water', unknown: '—' }[dir];
-  const arrow = { north: '↑', south: '↓', slack: '↔', unknown: '' }[dir];
+  const displayDir = status.slackAmount >= 0.7 ? 'slack' : status.dir;
+  const dirLabel = { north: 'Flooding North', south: 'Ebbing South', slack: 'Slack Water', unknown: '—' }[displayDir];
+  const arrow = { north: '↑', south: '↓', slack: '↔', unknown: '' }[displayDir];
   const ruleText = buildRuleText(status, now);
 
   document.getElementById('dateLine').textContent =
@@ -251,7 +273,7 @@ function render(curve, hilo) {
   document.getElementById('app').innerHTML = `
     <div class="now-banner">
       <div class="now-label">Current direction now</div>
-      <div class="now-dir ${dir}">${arrow} ${dirLabel}</div>
+      <div class="now-dir ${displayDir}">${arrow} ${dirLabel}</div>
       ${ruleText ? `<div class="now-rule">${ruleText}</div>` : ''}
     </div>
 
@@ -266,16 +288,22 @@ function render(curve, hilo) {
     </div>
 
     <div class="rules-section">
-      <div class="rules-title">Rules of Thumb Applied (Port of Skagit / La Conner)</div>
+      <div class="rules-title">Rules of Thumb (Port of Skagit / La Conner)</div>
       <ul>
-        <li><span class="rule-north">North current</span> flows 2–3.5 hrs before high water through 2–3.5 hrs after high water</li>
-        <li><span class="rule-south">South current</span> flows 2–3.5 hrs before low water through 2–3.5 hrs after low water</li>
-        <li><span class="rule-slack">Slack water</span> occurs 2–3.5 hrs after each high or low (larger tide range = closer to 3.5 hrs)</li>
+        <li><span class="rule-north">North current</span> flows ~2.5–4 hrs before high water through ~2.5–4 hrs after high water</li>
+        <li><span class="rule-south">South current</span> flows ~2.5–4 hrs before low water through ~2.5–4 hrs after low water</li>
+        <li><span class="rule-slack">Slack water</span> occurs ~2.5–4 hrs after each high or low</li>
+        <li>Small tidal range → slack closer to 2.5 hrs; large range → closer to 4 hrs</li>
       </ul>
       <div style="margin-top:0.6rem; font-size:0.72rem; color:#4a7a8a;">
-        Today's La Conner hi/lo:
+        Today's La Conner hi/lo (estimated slack based on tidal range):
         ${todayHiLo.filter(e => e.time >= dsMs && e.time <= deMs)
-          .map(e => `<strong style="color:#b0d4e8">${e.type === 'H' ? 'High' : 'Low'} ${e.height.toFixed(1)} ft</strong> at ${fmtTime(e.time)} → slack ~${fmtTime(e.time + SLACK_MIN_MS)}–${fmtTime(e.time + SLACK_MAX_MS)}`)
+          .map((e, i, arr) => {
+            const adj = i < arr.length - 1 ? arr[i+1] : (hilo.find(h => h.time > e.time) || e);
+            const r = tidalRange(e, adj);
+            const est = slackOffset(r);
+            return `<strong style="color:#b0d4e8">${e.type === 'H' ? 'High' : 'Low'} ${e.height.toFixed(1)} ft</strong> at ${fmtTime(e.time)} → slack ~${fmtTime(e.time + est)} <span style="color:#5a8a9a">(${r.toFixed(1)} ft range)</span>`;
+          })
           .join('<br>')}
       </div>
     </div>
@@ -297,7 +325,7 @@ function render(curve, hilo) {
     slack:   [66,165,245],
     unknown: [50,50,50]
   };
-  const BAND_ALPHA = 0.2;
+  const BAND_ALPHA = 0.28;
 
   new Chart(document.getElementById('tideChart').getContext('2d'), {
     type: 'line',
@@ -349,34 +377,23 @@ function render(curve, hilo) {
       beforeDraw(chart) {
         const { ctx, chartArea: { left, right, top, bottom }, scales: { x } } = chart;
         const sampleStep = 2 * 60000;
-        const blurRadius = 14;
 
-        // Sample raw direction colors at fine intervals
-        const samples = [];
         for (let t = dsMs; t <= deMs; t += sampleStep) {
-          const { dir } = currentAt(t, hilo);
-          samples.push(colorRGB[dir] || colorRGB.unknown);
-        }
-
-        // Box-blur the RGB samples to smooth transitions
-        const blurred = samples.map((_, i) => {
-          let rSum = 0, gSum = 0, bSum = 0, count = 0;
-          for (let j = i - blurRadius; j <= i + blurRadius; j++) {
-            const k = Math.max(0, Math.min(samples.length - 1, j));
-            rSum += samples[k][0]; gSum += samples[k][1]; bSum += samples[k][2];
-            count++;
-          }
-          return [Math.round(rSum/count), Math.round(gSum/count), Math.round(bSum/count)];
-        });
-
-        // Draw blurred bands
-        for (let i = 0; i < blurred.length - 1; i++) {
-          const t = dsMs + i * sampleStep;
-          const [r, g, b] = blurred[i];
+          const { dir, confidence, slackAmount } = currentAt(t, hilo);
           const x1 = x.getPixelForValue(t);
           const x2 = x.getPixelForValue(t + sampleStep);
-          ctx.fillStyle = `rgba(${r},${g},${b},${BAND_ALPHA})`;
-          ctx.fillRect(x1, top, x2 - x1 + 0.5, bottom - top);
+          const w = x2 - x1 + 0.5;
+
+          const dirRgb = colorRGB[dir] || colorRGB.unknown;
+          if (confidence > 0) {
+            ctx.fillStyle = `rgba(${dirRgb[0]},${dirRgb[1]},${dirRgb[2]},${BAND_ALPHA * confidence})`;
+            ctx.fillRect(x1, top, w, bottom - top);
+          }
+          if (slackAmount > 0) {
+            const s = colorRGB.slack;
+            ctx.fillStyle = `rgba(${s[0]},${s[1]},${s[2]},${BAND_ALPHA * slackAmount})`;
+            ctx.fillRect(x1, top, w, bottom - top);
+          }
         }
       }
     }, {
