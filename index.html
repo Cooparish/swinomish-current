@@ -5,10 +5,10 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Swinomish Channel Current Direction — La Conner Tide & Slack Water Estimator</title>
   <meta name="google-site-verification" content="lzZis3RsX4yyp3sdXJKgdm90fY5tbI0Phva54BiqDBY" />
-  <meta name="description" content="Live estimated current direction for the Swinomish Channel at La Conner, WA. See tide chart, predicted slack water windows, and whether the current is flooding north or ebbing south — based on local rules of thumb.">
-  <meta name="keywords" content="Swinomish Channel, current direction, La Conner, slack water, tide, Swinomish Slough, Skagit, boating, navigation estimate">
+  <meta name="description" content="Live estimated current direction for the Swinomish Channel at La Conner, WA. Uses hydraulic head between Padilla Bay and Skagit Bay to predict slack water and current direction.">
+  <meta name="keywords" content="Swinomish Channel, current direction, La Conner, slack water, tide, Swinomish Slough, Skagit, boating, navigation estimate, hydraulic head">
   <meta property="og:title" content="Swinomish Channel Current Direction">
-  <meta property="og:description" content="Live tide chart and estimated current direction for the Swinomish Channel at La Conner, WA. Slack water predictions based on local rules of thumb.">
+  <meta property="og:description" content="Live tide chart and estimated current direction for the Swinomish Channel at La Conner, WA. Hydraulic head model using two NOAA stations.">
   <meta property="og:type" content="website">
   <meta property="og:url" content="https://cooparish.github.io/swinomish-current/">
   <link rel="canonical" href="https://cooparish.github.io/swinomish-current/">
@@ -43,7 +43,7 @@
     .now-dir.south { color: #ef5350; }
     .now-dir.slack { color: #42a5f5; }
     .now-dir.unknown { color: #555; }
-    .now-rule { font-size: 0.78rem; color: #7aabb8; margin-top: 0.4rem; line-height: 1.5; }
+    .now-detail { font-size: 0.78rem; color: #7aabb8; margin-top: 0.4rem; line-height: 1.5; }
 
     .chart-section {
       background: #0c1e2e;
@@ -65,35 +65,61 @@
       display: flex;
       gap: 1rem;
       justify-content: center;
+      flex-wrap: wrap;
       margin-top: 0.5rem;
       font-size: 0.7rem;
       color: #7aabb8;
     }
     .legend-item { display: flex; align-items: center; gap: 0.3rem; }
     .legend-dot { width: 10px; height: 10px; border-radius: 3px; }
+    .legend-line { width: 14px; height: 2px; border-radius: 1px; }
 
-    .rules-section {
+    .slack-schedule {
       background: #0c1e2e;
       border: 1px solid #1b3d55;
       border-radius: 12px;
       padding: 0.8rem 1rem;
       margin-bottom: 0.8rem;
-      font-size: 0.78rem;
-      line-height: 1.7;
-      color: #7aabb8;
     }
-    .rules-section .rules-title {
+    .slack-schedule .section-title {
       font-size: 0.7rem;
       text-transform: uppercase;
       letter-spacing: 0.08em;
       color: #4a7a8a;
       margin-bottom: 0.5rem;
     }
-    .rules-section ul { padding-left: 1.2rem; margin: 0; }
-    .rules-section li { margin-bottom: 0.2rem; }
-    .rule-north { color: #4caf50; }
-    .rule-south { color: #ef5350; }
-    .rule-slack { color: #42a5f5; }
+    .slack-item {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      padding: 0.4rem 0;
+      border-bottom: 1px solid #0f2a3a;
+      font-size: 0.82rem;
+    }
+    .slack-item:last-child { border-bottom: none; }
+    .slack-time { color: #b0d4e8; font-weight: 600; }
+    .slack-detail { color: #5a8a9a; font-size: 0.75rem; }
+    .slack-past { opacity: 0.4; }
+
+    .method-section {
+      background: #0c1e2e;
+      border: 1px solid #1b3d55;
+      border-radius: 12px;
+      padding: 0.8rem 1rem;
+      margin-bottom: 0.8rem;
+      font-size: 0.75rem;
+      line-height: 1.7;
+      color: #5a8a9a;
+    }
+    .method-section .section-title {
+      font-size: 0.7rem;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      color: #4a7a8a;
+      margin-bottom: 0.5rem;
+    }
+    .method-section p { margin-bottom: 0.5rem; }
+    .method-section strong { color: #7aabb8; }
 
     .note {
       font-size: 0.62rem;
@@ -120,14 +146,12 @@
 </div>
 
 <script>
-const SEATTLE  = '9447130';
-const LACONNER = '9448558';
-const SLACK_EARLIEST_MS = 2.5 * 3600000;
-const SLACK_LATEST_MS   = 4.0 * 3600000;
-const SLACK_DURATION_MS = 20 * 60000;
+const NORTH_STATION = '9448682';
+const SOUTH_STATION = '9448558';
 
-const RANGE_SMALL_FT = 4;
-const RANGE_LARGE_FT = 12;
+const SLACK_THRESHOLD = 0.05;
+const TRANSITION_ZONE = 0.20;
+const BAND_ALPHA = 0.45;
 
 function parseT(s) { return new Date(s.replace(' ', 'T')).getTime(); }
 
@@ -138,207 +162,221 @@ function fmtTime(ms) {
 }
 
 function hrsMin(ms) {
-  const h = Math.floor(ms / 3600000);
-  const m = Math.round((ms % 3600000) / 60000);
+  const total = Math.abs(ms);
+  const h = Math.floor(total / 3600000);
+  const m = Math.round((total % 3600000) / 60000);
   if (h === 0) return `${m} min`;
   if (m === 0) return `${h} hr`;
   return `${h} hr ${m} min`;
 }
 
-async function fetchNOAA(station, interval = 'hilo') {
+async function fetchNOAA(station, interval) {
   const now = new Date();
   const d = n => { const x = new Date(now); x.setDate(x.getDate() + n); return x; };
   const fmt = x => `${x.getFullYear()}${String(x.getMonth()+1).padStart(2,'0')}${String(x.getDate()).padStart(2,'0')}`;
+  const range = interval === 'hilo' ? [-2, 2] : [-1, 1];
   const url = `https://api.tidesandcurrents.noaa.gov/api/prod/datagetter?` +
-    `begin_date=${fmt(d(-1))}&end_date=${fmt(d(1))}&station=${station}` +
+    `begin_date=${fmt(d(range[0]))}&end_date=${fmt(d(range[1]))}&station=${station}` +
     `&product=predictions&datum=MLLW&time_zone=lst_ldt&interval=${interval}` +
-    `&units=english&application=swinomish&format=json`;
+    `&units=english&application=swinomish_head&format=json`;
   const r = await fetch(url);
   const j = await r.json();
   if (j.error) throw new Error(j.error.message);
   return j.predictions;
 }
 
-async function fetchAllData() {
-  const [seattleCurveRaw, seattleHiLoRaw, laConnerHiLoRaw] = await Promise.all([
-    fetchNOAA(SEATTLE, '6'),
-    fetchNOAA(SEATTLE, 'hilo'),
-    fetchNOAA(LACONNER, 'hilo')
-  ]);
-
-  const laConnerHiLo = laConnerHiLoRaw.map(p => ({ time: parseT(p.t), height: parseFloat(p.v), type: p.type }));
-  const seattleHiLo  = seattleHiLoRaw.map(p => ({ time: parseT(p.t), height: parseFloat(p.v), type: p.type }));
-
-  // Calculate average time offset between Seattle and La Conner hi/lo
-  let offsetSum = 0, offsetCount = 0;
-  for (const lc of laConnerHiLo) {
-    const match = seattleHiLo.find(s => s.type === lc.type && Math.abs(s.time - lc.time) < 4 * 3600000);
-    if (match) { offsetSum += lc.time - match.time; offsetCount++; }
-  }
-  const timeOffset = offsetCount > 0 ? offsetSum / offsetCount : 30 * 60000;
-
-  // Shift Seattle 6-min curve by the calculated offset to approximate Swinomish
-  const curve = seattleCurveRaw.map(p => ({ x: parseT(p.t) + timeOffset, y: parseFloat(p.v) }));
-
-  return { curve, laConnerHiLo };
+function cosineInterp(hiloRaw, timePoints) {
+  const hilo = hiloRaw.map(p => ({ time: parseT(p.t), height: parseFloat(p.v), type: p.type }));
+  return timePoints.map(t => {
+    let prev = null, next = null;
+    for (let i = 0; i < hilo.length - 1; i++) {
+      if (hilo[i].time <= t && hilo[i + 1].time > t) {
+        prev = hilo[i];
+        next = hilo[i + 1];
+        break;
+      }
+    }
+    if (!prev || !next) return null;
+    const phase = Math.PI * (t - prev.time) / (next.time - prev.time);
+    const h = (prev.height + next.height) / 2 + (prev.height - next.height) / 2 * Math.cos(phase);
+    return { x: t, y: h };
+  });
 }
 
-function tidalRange(prev, next) {
-  return Math.abs(prev.height - next.height);
+function computeHead(northCurve, southCurve) {
+  const head = [];
+  for (let i = 0; i < northCurve.length; i++) {
+    if (!southCurve[i]) continue;
+    head.push({ x: northCurve[i].x, y: northCurve[i].y - southCurve[i].y });
+  }
+  return head;
 }
 
-function slackOffset(range) {
-  const t = Math.max(0, Math.min(1, (range - RANGE_SMALL_FT) / (RANGE_LARGE_FT - RANGE_SMALL_FT)));
-  return SLACK_EARLIEST_MS + t * (SLACK_LATEST_MS - SLACK_EARLIEST_MS);
+function findSlacks(headCurve) {
+  const slacks = [];
+  for (let i = 0; i < headCurve.length - 1; i++) {
+    const a = headCurve[i], b = headCurve[i + 1];
+    if (a.y * b.y < 0) {
+      const frac = Math.abs(a.y) / (Math.abs(a.y) + Math.abs(b.y));
+      const t = a.x + frac * (b.x - a.x);
+      const toDir = b.y > 0 ? 'south' : 'north';
+      slacks.push({ time: t, toDir });
+    }
+  }
+  return slacks;
 }
 
-function currentAt(ms, hilo) {
-  let pi = -1;
-  for (let i = 0; i < hilo.length; i++) {
-    if (hilo[i].time <= ms) pi = i; else break;
+function headAt(ms, headCurve) {
+  for (let i = 0; i < headCurve.length - 1; i++) {
+    if (headCurve[i].x <= ms && headCurve[i + 1].x > ms) {
+      const frac = (ms - headCurve[i].x) / (headCurve[i + 1].x - headCurve[i].x);
+      return headCurve[i].y + frac * (headCurve[i + 1].y - headCurve[i].y);
+    }
   }
-  if (pi < 0 || pi >= hilo.length - 1) return { dir: 'unknown', confidence: 0, slackAmount: 0 };
-
-  const prev = hilo[pi];
-  const next = hilo[pi + 1];
-  const since = ms - prev.time;
-  const range = tidalRange(prev, next);
-  const estSlack = slackOffset(range);
-  const slackCenter = prev.time + estSlack;
-
-  const beforeDir = prev.type === 'H' ? 'north' : 'south';
-  const afterDir  = prev.type === 'H' ? 'south' : 'north';
-
-  const distFromCenter = Math.abs(ms - slackCenter);
-  const transitionZone = 50 * 60000;
-  const coreZone = SLACK_DURATION_MS / 2;
-
-  if (distFromCenter <= coreZone) {
-    return { dir: ms < slackCenter ? beforeDir : afterDir, confidence: 0, slackAmount: 1, prev, next, since, estSlack, range };
-  }
-
-  const t = Math.min(1, (distFromCenter - coreZone) / (transitionZone - coreZone));
-  const slackAmount = 1 - t;
-  const confidence = t;
-  const dir = ms < slackCenter ? beforeDir : afterDir;
-  return { dir, confidence, slackAmount, prev, next, since, estSlack, range };
+  return 0;
 }
 
-function buildRuleText(status, now) {
-  const { prev, next, since, estSlack, range, slackAmount } = status;
-  if (!prev) return '';
+function getStatus(now, headCurve, slacks) {
+  const h = headAt(now, headCurve);
+  const absH = Math.abs(h);
 
-  const prevLabel = prev.type === 'H' ? 'high' : 'low';
-  const sinceStr = hrsMin(since);
-  const slackCenter = prev.time + estSlack;
-  const rangeNote = range != null ? ` (${range.toFixed(1)} ft range → ~${hrsMin(estSlack)} offset)` : '';
-
-  if (slackAmount >= 0.7) {
-    return `Slack water — ${sinceStr} after ${prevLabel} tide (${fmtTime(prev.time)})<br>` +
-           `Based on ${range.toFixed(1)} ft tidal range${rangeNote}`;
+  let dir, strength, slackAmount;
+  if (absH <= SLACK_THRESHOLD) {
+    dir = 'slack';
+    strength = 0;
+    slackAmount = 1;
+  } else if (absH <= TRANSITION_ZONE) {
+    const t = (absH - SLACK_THRESHOLD) / (TRANSITION_ZONE - SLACK_THRESHOLD);
+    dir = h > 0 ? 'south' : 'north';
+    strength = t;
+    slackAmount = 1 - t;
+  } else {
+    dir = h > 0 ? 'south' : 'north';
+    strength = 1;
+    slackAmount = 0;
   }
 
-  if (since < estSlack) {
-    return `${sinceStr} after ${prevLabel} tide (${fmtTime(prev.time)})<br>` +
-           `Slack estimated ~${fmtTime(slackCenter)}${rangeNote}`;
+  const maxH = headCurve.reduce((mx, p) => Math.max(mx, Math.abs(p.y)), 0);
+  const relStrength = maxH > 0 ? absH / maxH : 0;
+
+  let nextSlack = null, prevSlack = null;
+  for (const s of slacks) {
+    if (s.time > now && !nextSlack) nextSlack = s;
+    if (s.time <= now) prevSlack = s;
   }
 
-  const nextRange = tidalRange(next, prev);
-  const nextEst = slackOffset(nextRange);
-  const nextSlackCenter = next.time + nextEst;
-  const nextLabel = next.type === 'H' ? 'high' : 'low';
-  return `${sinceStr} after ${prevLabel} tide (${fmtTime(prev.time)})<br>` +
-         `Next slack ~${fmtTime(nextSlackCenter)} (after ${nextLabel})`;
+  return { dir, strength, slackAmount, head: h, relStrength, nextSlack, prevSlack };
 }
 
-function render(curve, hilo) {
+function render(northCurve, southCurve, headCurve, slacks) {
   const now = Date.now();
   const today = new Date(now);
-  const dayStart = new Date(today); dayStart.setHours(0,0,0,0);
-  const dayEnd   = new Date(today); dayEnd.setHours(23,59,59,999);
+  const dayStart = new Date(today); dayStart.setHours(0, 0, 0, 0);
+  const dayEnd = new Date(today); dayEnd.setHours(23, 59, 59, 999);
   const dsMs = dayStart.getTime(), deMs = dayEnd.getTime();
 
-  const todayCurve = curve.filter(p => p.x >= dsMs && p.x <= deMs);
-  const todayHiLo = hilo.filter(e => e.time >= dsMs - 4*3600000 && e.time <= deMs + 4*3600000);
-
-  const status = currentAt(now, hilo);
+  const status = getStatus(now, headCurve, slacks);
   const displayDir = status.slackAmount >= 0.7 ? 'slack' : status.dir;
-  const dirLabel = { north: 'Flooding North', south: 'Ebbing South', slack: 'Slack Water', unknown: '—' }[displayDir];
-  const arrow = { north: '↑', south: '↓', slack: '↔', unknown: '' }[displayDir];
-  const ruleText = buildRuleText(status, now);
+  const labels = { north: 'Flooding North', south: 'Ebbing South', slack: 'Slack Water', unknown: '—' };
+  const arrows = { north: '↑', south: '↓', slack: '↔', unknown: '' };
+
+  let detailText = '';
+  if (status.nextSlack) {
+    const until = status.nextSlack.time - now;
+    const toLabel = status.nextSlack.toDir === 'north' ? 'north flood' : 'south ebb';
+    detailText = `Next slack in ${hrsMin(until)} (${fmtTime(status.nextSlack.time)}) → ${toLabel}`;
+  }
+  if (displayDir !== 'slack' && status.relStrength > 0) {
+    const strengthLabel = status.relStrength > 0.7 ? 'Strong' : status.relStrength > 0.35 ? 'Moderate' : 'Weak';
+    detailText = `${strengthLabel} current` + (detailText ? `<br>${detailText}` : '');
+  }
 
   document.getElementById('dateLine').textContent =
     today.toLocaleDateString('en-US', { weekday: 'long', month: 'long', day: 'numeric' }) + '  ·  ' + fmtTime(now);
 
+  const todaySlacks = slacks.filter(s => s.time >= dsMs && s.time <= deMs);
+  const slackItems = todaySlacks.map(s => {
+    const past = s.time < now;
+    const toLabel = s.toDir === 'north' ? 'then north flood' : 'then south ebb';
+    return `<div class="slack-item${past ? ' slack-past' : ''}">
+      <span class="slack-time">${fmtTime(s.time)}</span>
+      <span class="slack-detail">${toLabel}</span>
+    </div>`;
+  }).join('');
+
+  const todayNorth = northCurve.filter(p => p.x >= dsMs && p.x <= deMs);
+  const todaySouth = southCurve.filter(p => p && p.x >= dsMs && p.x <= deMs);
+
   document.getElementById('app').innerHTML = `
     <div class="now-banner">
       <div class="now-label">Current direction now</div>
-      <div class="now-dir ${displayDir}">${arrow} ${dirLabel}</div>
-      ${ruleText ? `<div class="now-rule">${ruleText}</div>` : ''}
+      <div class="now-dir ${displayDir}">${arrows[displayDir]} ${labels[displayDir]}</div>
+      ${detailText ? `<div class="now-detail">${detailText}</div>` : ''}
     </div>
 
     <div class="chart-section">
-      <div class="chart-title">Swinomish Channel Tide + Estimated Current</div>
+      <div class="chart-title">Tide Heights &mdash; North vs South End</div>
       <div class="chart-wrap"><canvas id="tideChart"></canvas></div>
       <div class="legend">
-        <div class="legend-item"><div class="legend-dot" style="background:#4caf50"></div>North</div>
-        <div class="legend-item"><div class="legend-dot" style="background:#ef5350"></div>South</div>
+        <div class="legend-item"><div class="legend-line" style="background:#4dd0e1"></div>North (Padilla Bay)</div>
+        <div class="legend-item"><div class="legend-line" style="background:#ffb74d"></div>South (La Conner)</div>
+        <div class="legend-item"><div class="legend-dot" style="background:#4caf50"></div>North current</div>
+        <div class="legend-item"><div class="legend-dot" style="background:#ef5350"></div>South current</div>
         <div class="legend-item"><div class="legend-dot" style="background:#42a5f5"></div>Slack</div>
       </div>
     </div>
 
-    <div class="rules-section">
-      <div class="rules-title">Rules of Thumb (Port of Skagit / La Conner)</div>
-      <ul>
-        <li><span class="rule-north">North current</span> flows ~2.5–4 hrs before high water through ~2.5–4 hrs after high water</li>
-        <li><span class="rule-south">South current</span> flows ~2.5–4 hrs before low water through ~2.5–4 hrs after low water</li>
-        <li><span class="rule-slack">Slack water</span> occurs ~2.5–4 hrs after each high or low</li>
-        <li>Small tidal range → slack closer to 2.5 hrs; large range → closer to 4 hrs</li>
-      </ul>
-      <div style="margin-top:0.6rem; font-size:0.72rem; color:#4a7a8a;">
-        Today's La Conner hi/lo (estimated slack based on tidal range):
-        ${todayHiLo.filter(e => e.time >= dsMs && e.time <= deMs)
-          .map((e, i, arr) => {
-            const adj = i < arr.length - 1 ? arr[i+1] : (hilo.find(h => h.time > e.time) || e);
-            const r = tidalRange(e, adj);
-            const est = slackOffset(r);
-            return `<strong style="color:#b0d4e8">${e.type === 'H' ? 'High' : 'Low'} ${e.height.toFixed(1)} ft</strong> at ${fmtTime(e.time)} → slack ~${fmtTime(e.time + est)} <span style="color:#5a8a9a">(${r.toFixed(1)} ft range)</span>`;
-          })
-          .join('<br>')}
-      </div>
+    <div class="slack-schedule">
+      <div class="section-title">Today's Slack Times</div>
+      ${slackItems || '<div style="color:#5a8a9a; font-size:0.8rem;">No slack transitions today</div>'}
+    </div>
+
+    <div class="method-section">
+      <div class="section-title">How This Works</div>
+      <p>The Swinomish Channel connects <strong>Padilla Bay</strong> (north) to <strong>Skagit Bay</strong> (south).
+      Current flows from whichever end has higher water toward the lower end.</p>
+      <p>This tool computes the <strong>hydraulic head</strong> &mdash; the water-level difference between
+      NOAA station 9448682 (north) and 9448558 (south). When the head crosses zero, that's slack water.
+      The sign tells you which way the current flows.</p>
+      <p>This is more accurate than single-station offset rules, but still doesn't account for
+      Skagit River discharge, wind, or barometric pressure.</p>
     </div>
 
     <div class="note">
-      <strong style="color:#ef9a9a;">NOT FOR NAVIGATION.</strong> This tool is an informal estimate only — not an official source and not affiliated with
-      NOAA, the Coast Guard, or the Port of Skagit. Current direction is approximated from rules of thumb and may be
-      significantly wrong due to tidal range, river runoff, wind, or other conditions. Always verify with local observation
-      and use official NOAA data for navigation decisions.<br><br>
-      Tide curve: Seattle 6-min predictions (NOAA 9447130) time-shifted to match La Conner hi/lo (NOAA 9448558).
-      Current direction: estimated from La Conner hi/lo using local rules of thumb.
-      <a href="https://tidesandcurrents.noaa.gov/noaatidepredictions.html?id=9448558" target="_blank">NOAA source</a>
+      <strong style="color:#ef9a9a;">NOT FOR NAVIGATION.</strong> This tool is an informal estimate only &mdash; not an official source and not affiliated with
+      NOAA, the Coast Guard, or the Port of Skagit. Current direction is modeled from the hydraulic head between two NOAA
+      tide prediction stations and may be wrong due to river runoff, wind, or other conditions. Always verify with local
+      observation and use official NOAA data for navigation decisions.<br><br>
+      North: <a href="https://tidesandcurrents.noaa.gov/noaatidepredictions.html?id=9448682" target="_blank">NOAA 9448682</a> &middot;
+      South: <a href="https://tidesandcurrents.noaa.gov/noaatidepredictions.html?id=9448558" target="_blank">NOAA 9448558</a>
     </div>
   `;
 
-  const colorRGB = {
-    north:   [76,175,80],
-    south:   [239,83,80],
-    slack:   [66,165,245],
-    unknown: [50,50,50]
-  };
-  const BAND_ALPHA = 0.28;
+  const colorRGB = { north: [76,175,80], south: [239,83,80], slack: [66,165,245] };
 
   new Chart(document.getElementById('tideChart').getContext('2d'), {
     type: 'line',
     data: {
-      datasets: [{
-        data: todayCurve,
-        borderColor: '#b0d4e8',
-        backgroundColor: 'rgba(176,212,232,0.06)',
-        borderWidth: 2,
-        pointRadius: 0,
-        fill: true,
-        tension: 0.4
-      }]
+      datasets: [
+        {
+          label: 'North (Padilla Bay)',
+          data: todayNorth,
+          borderColor: '#4dd0e1',
+          borderWidth: 2,
+          pointRadius: 0,
+          fill: false,
+          tension: 0.4
+        },
+        {
+          label: 'South (La Conner)',
+          data: todaySouth,
+          borderColor: '#ffb74d',
+          borderWidth: 2,
+          pointRadius: 0,
+          fill: false,
+          tension: 0.4
+        }
+      ]
     },
     options: {
       responsive: true, maintainAspectRatio: false, animation: false,
@@ -346,7 +384,7 @@ function render(curve, hilo) {
         legend: { display: false },
         tooltip: {
           enabled: true,
-          displayColors: false,
+          displayColors: true,
           backgroundColor: 'rgba(12,30,46,0.9)',
           borderColor: '#1b3d55',
           borderWidth: 1,
@@ -354,7 +392,18 @@ function render(curve, hilo) {
           bodyFont: { size: 12 },
           callbacks: {
             title: items => fmtTime(items[0].parsed.x),
-            label: item => item.parsed.y.toFixed(1) + ' ft'
+            label: item => {
+              const name = item.datasetIndex === 0 ? 'North' : 'South';
+              return `${name}: ${item.parsed.y.toFixed(1)} ft`;
+            },
+            afterBody: items => {
+              const t = items[0].parsed.x;
+              const h = headAt(t, headCurve);
+              const absH = Math.abs(h);
+              if (absH < SLACK_THRESHOLD) return 'Slack water';
+              const dir = h > 0 ? 'South ebb' : 'North flood';
+              return `${dir} (head: ${h > 0 ? '+' : ''}${h.toFixed(2)} ft)`;
+            }
           }
         }
       },
@@ -373,74 +422,70 @@ function render(curve, hilo) {
       }
     },
     plugins: [{
-      id: 'currentBands',
+      id: 'headBands',
       beforeDraw(chart) {
         const { ctx, chartArea: { left, right, top, bottom }, scales: { x } } = chart;
-        const sampleStep = 2 * 60000;
-
-        for (let t = dsMs; t <= deMs; t += sampleStep) {
-          const { dir, confidence, slackAmount } = currentAt(t, hilo);
+        const step = 6 * 60000;
+        for (let t = dsMs; t <= deMs; t += step) {
+          const h = headAt(t, headCurve);
+          const absH = Math.abs(h);
           const x1 = x.getPixelForValue(t);
-          const x2 = x.getPixelForValue(t + sampleStep);
+          const x2 = x.getPixelForValue(t + step);
           const w = x2 - x1 + 0.5;
 
-          const dirRgb = colorRGB[dir] || colorRGB.unknown;
-          if (confidence > 0) {
-            ctx.fillStyle = `rgba(${dirRgb[0]},${dirRgb[1]},${dirRgb[2]},${BAND_ALPHA * confidence})`;
-            ctx.fillRect(x1, top, w, bottom - top);
-          }
-          if (slackAmount > 0) {
+          if (absH <= SLACK_THRESHOLD) {
             const s = colorRGB.slack;
-            ctx.fillStyle = `rgba(${s[0]},${s[1]},${s[2]},${BAND_ALPHA * slackAmount})`;
+            ctx.fillStyle = `rgba(${s[0]},${s[1]},${s[2]},${BAND_ALPHA * 0.6})`;
+            ctx.fillRect(x1, top, w, bottom - top);
+          } else if (absH <= TRANSITION_ZONE) {
+            const blend = (absH - SLACK_THRESHOLD) / (TRANSITION_ZONE - SLACK_THRESHOLD);
+            const dir = h > 0 ? 'south' : 'north';
+            const dc = colorRGB[dir];
+            const sc = colorRGB.slack;
+            ctx.fillStyle = `rgba(${dc[0]},${dc[1]},${dc[2]},${BAND_ALPHA * blend})`;
+            ctx.fillRect(x1, top, w, bottom - top);
+            ctx.fillStyle = `rgba(${sc[0]},${sc[1]},${sc[2]},${BAND_ALPHA * 0.6 * (1 - blend)})`;
+            ctx.fillRect(x1, top, w, bottom - top);
+          } else {
+            const dir = h > 0 ? 'south' : 'north';
+            const dc = colorRGB[dir];
+            const intensity = Math.min(1, absH / (TRANSITION_ZONE * 3));
+            ctx.fillStyle = `rgba(${dc[0]},${dc[1]},${dc[2]},${BAND_ALPHA * (0.5 + 0.5 * intensity)})`;
             ctx.fillRect(x1, top, w, bottom - top);
           }
         }
       }
     }, {
-      id: 'annotations',
+      id: 'slackLines',
       afterDraw(chart) {
-        const { ctx, scales: { x, y } } = chart;
+        const { ctx, chartArea: { top, bottom }, scales: { x, y } } = chart;
 
-        // Hi/Lo vertical lines and labels
-        for (const ev of todayHiLo) {
-          if (ev.time < dsMs || ev.time > deMs) continue;
-          const px = x.getPixelForValue(ev.time);
-          const py = y.getPixelForValue(ev.height);
-
-          // Dashed vertical line
+        for (const s of todaySlacks) {
+          const px = x.getPixelForValue(s.time);
           ctx.save();
-          ctx.strokeStyle = 'rgba(176,212,232,0.2)';
-          ctx.lineWidth = 1;
-          ctx.setLineDash([3, 4]);
-          ctx.beginPath(); ctx.moveTo(px, y.top); ctx.lineTo(px, y.bottom); ctx.stroke();
+          ctx.strokeStyle = 'rgba(66,165,245,0.5)';
+          ctx.lineWidth = 1.5;
+          ctx.setLineDash([4, 4]);
+          ctx.beginPath(); ctx.moveTo(px, top); ctx.lineTo(px, bottom); ctx.stroke();
           ctx.setLineDash([]);
-          ctx.restore();
-
-          // Height + time labels
-          const above = ev.type === 'H';
-          ctx.save();
-          ctx.fillStyle = '#b0d4e8';
-          ctx.font = '11px -apple-system, sans-serif';
+          ctx.fillStyle = '#42a5f5';
+          ctx.font = '9px -apple-system, sans-serif';
           ctx.textAlign = 'center';
-          ctx.fillText(`${ev.height.toFixed(1)} ft`, px, py + (above ? -18 : 22));
-          ctx.fillStyle = '#4a7a8a';
-          ctx.font = '10px -apple-system, sans-serif';
-          ctx.fillText(fmtTime(ev.time), px, py + (above ? -6 : 34));
+          ctx.fillText('slack', px, top - 4);
           ctx.restore();
         }
 
-        // Now line
         const nx = x.getPixelForValue(now);
         ctx.save();
-        ctx.strokeStyle = 'rgba(255,255,255,0.6)';
+        ctx.strokeStyle = 'rgba(255,255,255,0.7)';
         ctx.lineWidth = 1.5;
         ctx.setLineDash([4, 3]);
-        ctx.beginPath(); ctx.moveTo(nx, y.top); ctx.lineTo(nx, y.bottom); ctx.stroke();
+        ctx.beginPath(); ctx.moveTo(nx, top); ctx.lineTo(nx, bottom); ctx.stroke();
         ctx.setLineDash([]);
         ctx.fillStyle = '#ddd';
         ctx.font = '9px -apple-system, sans-serif';
         ctx.textAlign = 'center';
-        ctx.fillText('Now', nx, y.top - 4);
+        ctx.fillText('Now', nx, top - 4);
         ctx.restore();
       }
     }]
@@ -449,8 +494,27 @@ function render(curve, hilo) {
 
 (async () => {
   try {
-    const { curve, laConnerHiLo } = await fetchAllData();
-    render(curve, laConnerHiLo);
+    const [north6minRaw, southHiLoRaw] = await Promise.all([
+      fetchNOAA(NORTH_STATION, '6'),
+      fetchNOAA(SOUTH_STATION, 'hilo')
+    ]);
+
+    const northCurve = north6minRaw.map(p => ({ x: parseT(p.t), y: parseFloat(p.v) }));
+    const timePoints = northCurve.map(p => p.x);
+    const southCurve = cosineInterp(southHiLoRaw, timePoints);
+
+    const validNorth = [], validSouth = [];
+    for (let i = 0; i < northCurve.length; i++) {
+      if (southCurve[i]) {
+        validNorth.push(northCurve[i]);
+        validSouth.push(southCurve[i]);
+      }
+    }
+
+    const headCurve = computeHead(validNorth, validSouth);
+    const slacks = findSlacks(headCurve);
+
+    render(validNorth, validSouth, headCurve, slacks);
   } catch (err) {
     document.getElementById('app').innerHTML =
       `<p class="error">Failed to load tide data.<br>${err.message}<br><br>
